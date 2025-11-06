@@ -1,0 +1,142 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: network-monitoring
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ebpf-netmon
+  namespace: network-monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ebpf-netmon
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ebpf-netmon
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ebpf-netmon
+subjects:
+- kind: ServiceAccount
+  name: ebpf-netmon
+  namespace: network-monitoring
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ebpf-netmon
+  namespace: network-monitoring
+  labels:
+    app: ebpf-netmon
+spec:
+  selector:
+    matchLabels:
+      app: ebpf-netmon
+  template:
+    metadata:
+      labels:
+        app: ebpf-netmon
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: ebpf-netmon
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      
+      # Tolerate all taints to run on all nodes
+      tolerations:
+      - operator: Exists
+      
+      containers:
+      - name: netmon
+        image: your-registry/ebpf-netmon:latest
+        imagePullPolicy: Always
+        
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        
+        securityContext:
+          privileged: true  # Required for eBPF
+          capabilities:
+            add:
+            - SYS_ADMIN      # Required for eBPF
+            - SYS_RESOURCE   # Required for rlimit
+            - NET_ADMIN      # Required for network tracing
+          readOnlyRootFilesystem: true
+        
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        
+        volumeMounts:
+        - name: sys
+          mountPath: /sys
+          readOnly: true
+        - name: debugfs
+          mountPath: /sys/kernel/debug
+        - name: bpffs
+          mountPath: /sys/fs/bpf
+        - name: proc
+          mountPath: /proc
+          readOnly: true
+        - name: containerd-storage
+          mountPath: /var/lib/containerd
+          readOnly: true
+        - name: docker-storage
+          mountPath: /var/lib/docker
+          readOnly: true
+        - name: crio-storage
+          mountPath: /var/lib/containers
+          readOnly: true
+        
+      volumes:
+      - name: sys
+        hostPath:
+          path: /sys
+          type: Directory
+      - name: debugfs
+        hostPath:
+          path: /sys/kernel/debug
+          type: Directory
+      - name: bpffs
+        hostPath:
+          path: /sys/fs/bpf
+          type: DirectoryOrCreate
+      - name: proc
+        hostPath:
+          path: /proc
+          type: Directory
+      - name: containerd-storage
+        hostPath:
+          path: /var/lib/containerd
+          type: DirectoryOrCreate
+      - name: docker-storage
+        hostPath:
+          path: /var/lib/docker
+          type: DirectoryOrCreate
+      - name: crio-storage
+        hostPath:
+          path: /var/lib/containers
+          type: DirectoryOrCreate
+      
+      # Security policies
+      priorityClassName: system-node-critical

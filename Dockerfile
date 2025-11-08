@@ -9,13 +9,16 @@ RUN apk add --no-cache \
     linux-headers \
     make \
     gcc \
-    musl-dev
+    musl-dev \
+    bpf-dev
 
 WORKDIR /build
 
 # Copy go mod files
-COPY go.mod go.sum ./
-RUN go mod download
+COPY go.mod ./
+
+# Download dependencies and create go.sum
+RUN go mod download && go mod tidy
 
 # Copy source
 COPY . .

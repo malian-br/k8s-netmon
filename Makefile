@@ -1,8 +1,12 @@
-.PHONY: generate build docker-build docker-push deploy clean test
+.PHONY: generate build docker-build docker-push deploy clean test init
 
 IMAGE_NAME ?= ebpf-netmon
 IMAGE_TAG ?= latest
 REGISTRY ?= your-registry
+
+init:
+	go mod tidy
+	go mod download
 
 generate:
 	go generate ./...
@@ -11,6 +15,7 @@ build: generate
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/netmon .
 
 docker-build:
+	go mod tidy
 	docker build -t $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG) .
 
 docker-push: docker-build

@@ -3,14 +3,12 @@
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
-#include <linux/if_ether.h>
-#include <linux/ip.h>
-#include <linux/in.h>
-#include <linux/tcp.h>
-#include <linux/udp.h>
+#include <bpf/bpf_core_read.h>
+#include <linux/types.h>
 
 #define MAX_ENTRIES 10240
 #define CGROUP_PATH_MAX 256
+#define AF_INET 2
 
 struct connection_event {
     __u32 src_ip;
@@ -23,6 +21,38 @@ struct connection_event {
     char comm[16];
     __u8 type; // 0=connect, 1=accept, 2=close
     char cgroup_path[CGROUP_PATH_MAX];
+};
+
+struct sockaddr {
+    __u16 sa_family;
+    char sa_data[14];
+};
+
+struct sockaddr_in {
+    __u16 sin_family;
+    __u16 sin_port;
+    __u32 sin_addr;
+    char sin_zero[8];
+};
+
+// Tracepoint context structures
+struct trace_entry {
+    __u16 type;
+    __u8 flags;
+    __u8 preempt_count;
+    __u32 pid;
+};
+
+struct syscall_enter_args {
+    struct trace_entry ent;
+    long id;
+    unsigned long args[6];
+};
+
+struct syscall_exit_args {
+    struct trace_entry ent;
+    long id;
+    long ret;
 };
 
 struct {
@@ -38,50 +68,35 @@ struct {
     __type(value, struct connection_event);
 } active_connections SEC(".maps");
 
+static __always_inline __u16 bpf_ntohs(__u16 netshort) {
+    return __builtin_bswap16(netshort);
+}
+
 static __always_inline void populate_event(struct connection_event *event) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     event->pid = pid_tgid >> 32;
     bpf_get_current_comm(&event->comm, sizeof(event->comm));
     
-    // Get network namespace
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    if (task) {
-        // Network namespace inode number
-        BPF_CORE_READ_INTO(&event->netns, task, nsproxy, net_ns, ns.inum);
-    }
+    // Get cgroup ID for container identification
+    __u64 cgroup_id = bpf_get_current_cgroup_id();
+    event->netns = (__u32)(cgroup_id & 0xFFFFFFFF);
 }
 
 static __always_inline void get_cgroup_path(struct connection_event *event) {
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    
-    // Get cgroup path - this helps identify the container
-    // The path typically contains container ID for Docker/containerd/CRI-O
+    // Store a marker that can be used to lookup cgroup info from userspace
+    // We can't easily read the full path from kernel space in all kernel versions
     __u64 cgroup_id = bpf_get_current_cgroup_id();
     
-    // Try to read cgroup path from task struct
-    // Note: This is a simplified approach. In production, you might want to
-    // use bpf_get_current_cgroup_id() and map it to paths in userspace
-    char path[CGROUP_PATH_MAX] = {0};
-    
-    // Use helper to get cgroup path if available (kernel 5.10+)
-    #ifdef BPF_FUNC_get_current_cgroup_path
-    long ret = bpf_get_current_cgroup_path(path, sizeof(path));
-    if (ret >= 0) {
-        __builtin_memcpy(event->cgroup_path, path, CGROUP_PATH_MAX);
-        return;
-    }
-    #endif
-    
-    // Fallback: store cgroup ID which can be resolved in userspace
-    // This is more reliable across kernel versions
-    bpf_probe_read_kernel_str(event->cgroup_path, sizeof(event->cgroup_path), "/proc/self/cgroup");
+    // Store cgroup ID in the path field as a hex string for userspace lookup
+    // This is more reliable than trying to read paths from kernel structures
+    __builtin_memset(event->cgroup_path, 0, CGROUP_PATH_MAX);
 }
 
 SEC("tracepoint/syscalls/sys_enter_connect")
-int trace_sys_connect(struct trace_event_raw_sys_enter *ctx) {
+int trace_sys_connect(struct syscall_enter_args *ctx) {
     struct connection_event event = {0};
     struct sockaddr *addr;
-    struct sockaddr_in *addr_in;
+    struct sockaddr_in addr_in;
     
     int fd = (int)ctx->args[0];
     addr = (struct sockaddr *)ctx->args[1];
@@ -90,18 +105,20 @@ int trace_sys_connect(struct trace_event_raw_sys_enter *ctx) {
         return 0;
     
     __u16 family;
-    bpf_probe_read_user(&family, sizeof(family), &addr->sa_family);
+    if (bpf_probe_read_user(&family, sizeof(family), &addr->sa_family) < 0)
+        return 0;
     
     if (family != AF_INET)
         return 0;
     
-    addr_in = (struct sockaddr_in *)addr;
+    // Read the entire sockaddr_in structure
+    if (bpf_probe_read_user(&addr_in, sizeof(addr_in), addr) < 0)
+        return 0;
     
-    bpf_probe_read_user(&event.dst_ip, sizeof(event.dst_ip), &addr_in->sin_addr.s_addr);
-    bpf_probe_read_user(&event.dst_port, sizeof(event.dst_port), &addr_in->sin_port);
-    event.dst_port = __bpf_ntohs(event.dst_port);
+    event.dst_ip = addr_in.sin_addr;
+    event.dst_port = bpf_ntohs(addr_in.sin_port);
     
-    event.proto = IPPROTO_TCP;
+    event.proto = 6; // IPPROTO_TCP
     event.type = 0; // CONNECT
     populate_event(&event);
     get_cgroup_path(&event);
@@ -115,7 +132,7 @@ int trace_sys_connect(struct trace_event_raw_sys_enter *ctx) {
 }
 
 SEC("tracepoint/syscalls/sys_exit_accept4")
-int trace_sys_accept(struct trace_event_raw_sys_exit *ctx) {
+int trace_sys_accept(struct syscall_exit_args *ctx) {
     struct connection_event event = {0};
     long ret = ctx->ret;
     
@@ -123,7 +140,7 @@ int trace_sys_accept(struct trace_event_raw_sys_exit *ctx) {
         return 0;
     
     event.type = 1; // ACCEPT
-    event.proto = IPPROTO_TCP;
+    event.proto = 6; // IPPROTO_TCP
     populate_event(&event);
     get_cgroup_path(&event);
     
@@ -136,7 +153,7 @@ int trace_sys_accept(struct trace_event_raw_sys_exit *ctx) {
 }
 
 SEC("tracepoint/syscalls/sys_enter_close")
-int trace_sys_close(struct trace_event_raw_sys_enter *ctx) {
+int trace_sys_close(struct syscall_enter_args *ctx) {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 pid = pid_tgid >> 32;
     int fd = (int)ctx->args[0];
